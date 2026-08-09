@@ -1,7 +1,10 @@
-// Package tracking is the Pickpoint realtime tracking client.
+// Package tracking is the Go client for Pickpoint realtime tracking.
 //
-// Preferred transport for Go: gRPC (Tracking.Session).
-// WebSocket is available for parity with browser/device clients.
+// Default transport is binary WebSocket (tracking.v2.proto). gRPC remains available
+// via Config.Transport = TransportGRPC.
 //
-// Wire schema: github.com/pickpoint/pickpoint-proto tracking/v2.
+//	client, err := tracking.Connect(ctx, tracking.Config{
+//	    Endpoint: "ws://127.0.0.1:3100",
+//	    Device:   &tracking.DeviceAuth{ClientID: "dev-1", ClientSecret: "secret"},
+//	})
 package tracking
