@@ -345,4 +345,20 @@ PICKPOINT_API_KEY=… go test ./pickpoint -run E2E -count=1
 # optional: PICKPOINT_BASE_URL=https://api.pickpoint.io
 ```
 
+### CI & release
+
+- **PR** → `.github/workflows/ci.yml` (`go test`)
+- **Push to `main`** (untagged HEAD) → bump **patch** in `VERSION`, tag `vX.Y.Z`, GitHub Release in the same job  
+  (tag push via `GITHUB_TOKEN` does not start new workflows — release cannot wait on the tag event)
+- **Manual tag `v*`** (pushed by a human) → GitHub Release
+
+Consumers pick up versions via the module path + tag, e.g. `go get github.com/pickpoint/go-sdk@v2.0.1`.
+
+Minor/major: bump `VERSION` in a PR, merge with `[skip release]` in the commit message, then:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
 Protobuf stubs under `tracking/v2` are generated from [`pickpoint-proto`](https://github.com/pickpoint/pickpoint-proto); regenerate when the schema moves, then commit the Go output with this module.
