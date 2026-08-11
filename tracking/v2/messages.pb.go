@@ -1557,19 +1557,19 @@ func (x *LocationAdded) GetClientSeq() uint64 {
 }
 
 type Subscribed struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	DeviceUid         string                 `protobuf:"bytes,1,opt,name=device_uid,json=deviceUid,proto3" json:"device_uid,omitempty"`
-	TrackUid          string                 `protobuf:"bytes,2,opt,name=track_uid,json=trackUid,proto3" json:"track_uid,omitempty"`
-	LastLocation      *LatLng                `protobuf:"bytes,3,opt,name=last_location,json=lastLocation,proto3" json:"last_location,omitempty"`
-	Route             []*LatLng              `protobuf:"bytes,4,rep,name=route,proto3" json:"route,omitempty"`
-	Locations         []*LatLng              `protobuf:"bytes,5,rep,name=locations,proto3" json:"locations,omitempty"`
-	EstimatedDistance float64                `protobuf:"fixed64,6,opt,name=estimated_distance,json=estimatedDistance,proto3" json:"estimated_distance,omitempty"`
-	EstimatedDuration float64                `protobuf:"fixed64,7,opt,name=estimated_duration,json=estimatedDuration,proto3" json:"estimated_duration,omitempty"`
-	StartLocationName string                 `protobuf:"bytes,8,opt,name=start_location_name,json=startLocationName,proto3" json:"start_location_name,omitempty"`
-	EndLocationName   string                 `protobuf:"bytes,9,opt,name=end_location_name,json=endLocationName,proto3" json:"end_location_name,omitempty"`
-	Metadata          []byte                 `protobuf:"bytes,10,opt,name=metadata,proto3" json:"metadata,omitempty"`
-	Online            bool                   `protobuf:"varint,11,opt,name=online,proto3" json:"online,omitempty"`
-	LastSeenMs        *int64                 `protobuf:"varint,12,opt,name=last_seen_ms,json=lastSeenMs,proto3,oneof" json:"last_seen_ms,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	DeviceUid    string                 `protobuf:"bytes,1,opt,name=device_uid,json=deviceUid,proto3" json:"device_uid,omitempty"`
+	TrackUid     string                 `protobuf:"bytes,2,opt,name=track_uid,json=trackUid,proto3" json:"track_uid,omitempty"`
+	LastLocation *LatLng                `protobuf:"bytes,3,opt,name=last_location,json=lastLocation,proto3" json:"last_location,omitempty"`
+	// Planned route (if any). Live trail is LocationAdded only — not a full history dump.
+	Route             []*LatLng `protobuf:"bytes,4,rep,name=route,proto3" json:"route,omitempty"`
+	EstimatedDistance float64   `protobuf:"fixed64,6,opt,name=estimated_distance,json=estimatedDistance,proto3" json:"estimated_distance,omitempty"`
+	EstimatedDuration float64   `protobuf:"fixed64,7,opt,name=estimated_duration,json=estimatedDuration,proto3" json:"estimated_duration,omitempty"`
+	StartLocationName string    `protobuf:"bytes,8,opt,name=start_location_name,json=startLocationName,proto3" json:"start_location_name,omitempty"`
+	EndLocationName   string    `protobuf:"bytes,9,opt,name=end_location_name,json=endLocationName,proto3" json:"end_location_name,omitempty"`
+	Metadata          []byte    `protobuf:"bytes,10,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	Online            bool      `protobuf:"varint,11,opt,name=online,proto3" json:"online,omitempty"`
+	LastSeenMs        *int64    `protobuf:"varint,12,opt,name=last_seen_ms,json=lastSeenMs,proto3,oneof" json:"last_seen_ms,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1628,13 +1628,6 @@ func (x *Subscribed) GetLastLocation() *LatLng {
 func (x *Subscribed) GetRoute() []*LatLng {
 	if x != nil {
 		return x.Route
-	}
-	return nil
-}
-
-func (x *Subscribed) GetLocations() []*LatLng {
-	if x != nil {
-		return x.Locations
 	}
 	return nil
 }
@@ -2134,15 +2127,14 @@ const file_tracking_v2_messages_proto_rawDesc = "" +
 	"\ttrack_uid\x18\x02 \x01(\tR\btrackUid\x12)\n" +
 	"\x05point\x18\x03 \x01(\v2\x13.tracking.v2.LatLngR\x05point\x12\x1d\n" +
 	"\n" +
-	"client_seq\x18\x04 \x01(\x04R\tclientSeq\"\x86\x04\n" +
+	"client_seq\x18\x04 \x01(\x04R\tclientSeq\"\xe4\x03\n" +
 	"\n" +
 	"Subscribed\x12\x1d\n" +
 	"\n" +
 	"device_uid\x18\x01 \x01(\tR\tdeviceUid\x12\x1b\n" +
 	"\ttrack_uid\x18\x02 \x01(\tR\btrackUid\x128\n" +
 	"\rlast_location\x18\x03 \x01(\v2\x13.tracking.v2.LatLngR\flastLocation\x12)\n" +
-	"\x05route\x18\x04 \x03(\v2\x13.tracking.v2.LatLngR\x05route\x121\n" +
-	"\tlocations\x18\x05 \x03(\v2\x13.tracking.v2.LatLngR\tlocations\x12-\n" +
+	"\x05route\x18\x04 \x03(\v2\x13.tracking.v2.LatLngR\x05route\x12-\n" +
 	"\x12estimated_distance\x18\x06 \x01(\x01R\x11estimatedDistance\x12-\n" +
 	"\x12estimated_duration\x18\a \x01(\x01R\x11estimatedDuration\x12.\n" +
 	"\x13start_location_name\x18\b \x01(\tR\x11startLocationName\x12*\n" +
@@ -2152,7 +2144,7 @@ const file_tracking_v2_messages_proto_rawDesc = "" +
 	"\x06online\x18\v \x01(\bR\x06online\x12%\n" +
 	"\flast_seen_ms\x18\f \x01(\x03H\x00R\n" +
 	"lastSeenMs\x88\x01\x01B\x0f\n" +
-	"\r_last_seen_ms\"\x14\n" +
+	"\r_last_seen_msJ\x04\b\x05\x10\x06R\tlocations\"\x14\n" +
 	"\x12ListenerSubscribed\"\xbb\x01\n" +
 	"\x05Error\x12*\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x16.tracking.v2.ErrorCodeR\x04code\x12\x18\n" +
@@ -2274,13 +2266,12 @@ var file_tracking_v2_messages_proto_depIdxs = []int32{
 	2,  // 28: tracking.v2.LocationAdded.point:type_name -> tracking.v2.LatLng
 	2,  // 29: tracking.v2.Subscribed.last_location:type_name -> tracking.v2.LatLng
 	2,  // 30: tracking.v2.Subscribed.route:type_name -> tracking.v2.LatLng
-	2,  // 31: tracking.v2.Subscribed.locations:type_name -> tracking.v2.LatLng
-	1,  // 32: tracking.v2.Error.code:type_name -> tracking.v2.ErrorCode
-	33, // [33:33] is the sub-list for method output_type
-	33, // [33:33] is the sub-list for method input_type
-	33, // [33:33] is the sub-list for extension type_name
-	33, // [33:33] is the sub-list for extension extendee
-	0,  // [0:33] is the sub-list for field type_name
+	1,  // 31: tracking.v2.Error.code:type_name -> tracking.v2.ErrorCode
+	32, // [32:32] is the sub-list for method output_type
+	32, // [32:32] is the sub-list for method input_type
+	32, // [32:32] is the sub-list for extension type_name
+	32, // [32:32] is the sub-list for extension extendee
+	0,  // [0:32] is the sub-list for field type_name
 }
 
 func init() { file_tracking_v2_messages_proto_init() }
