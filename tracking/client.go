@@ -8,20 +8,12 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/proto"
-
-	pb "github.com/pickpoint/go-sdk/tracking/v2"
 )
 
-const Subprotocol = "tracking.v2.proto"
-
-// MaxPublishHz is the hard cap for Publish calls (points per second).
+// MaxPublishHz is the hard cap for accepted Publish calls (points per second).
 const MaxPublishHz = 50
 
-// MinPublishInterval is the minimum gap between accepted points.
+// MinPublishInterval is the minimum gap between accepted online points.
 const MinPublishInterval = time.Second / MaxPublishHz
 
 // MaxEventBytes / MaxEventHz bound opaque custom events (ephemeral fan-out).
@@ -29,17 +21,7 @@ const MaxEventBytes = 4 * 1024
 const MaxEventHz = 1
 const MinEventInterval = time.Second / MaxEventHz
 
-// Transport selects the edge protocol.
-type Transport int
-
-const (
-	// TransportWS is the default: binary protobuf on /v2/tracking/ws (lowest overhead).
-	TransportWS Transport = iota
-	// TransportGRPC is optional for mesh/agents that already speak gRPC.
-	TransportGRPC
-)
-
-// ConnectionState mirrors the JS tracking client state machine.
+// ConnectionState mirrors the tracking client state machine.
 type ConnectionState string
 
 const (
@@ -64,38 +46,43 @@ type ListenerAuth struct {
 // Exactly one of device / listener should be non-nil.
 type RefreshAuthFunc func(ctx context.Context) (device *DeviceAuth, listener *ListenerAuth, err error)
 
+type subOpts struct {
+	includeEvents bool
+	minInterval   uint16
+	handle        uint8
+}
+
 // Config opens a session against a Pickpoint tracking endpoint.
 type Config struct {
-	// Endpoint:
-	//   WS:   "ws://host:3100", "wss://…", or "host:3100" (→ ws://…/v2/tracking/ws)
-	//   gRPC: "host:3101"
-	Endpoint  string
-	Transport Transport
-	Device    *DeviceAuth
-	Listener  *ListenerAuth
-	// Path for WS (default /v2/tracking/ws).
+	// Endpoint is the tracking host, e.g. "wss://tracking.pickpoint.io".
+	// The SDK appends /v2/ws unless WSPath is set.
+	Endpoint string
+	Device   *DeviceAuth
+	Listener *ListenerAuth
+	// Path for WS (default /v2/ws).
 	WSPath string
-	// DialOptions optional extras for gRPC.
-	DialOptions []grpc.DialOption
+	// Subscribe: listener device UIDs to watch after Hello (and after reconnect).
+	Subscribe []string
 
-	// DisableReconnect turns off auto-reconnect (WS only; default enabled).
+	// DisableReconnect turns off auto-reconnect (default enabled).
 	DisableReconnect bool
 	// Reconnect backoff (defaults: 500ms … 30s, unlimited attempts).
 	ReconnectMinDelay    time.Duration
 	ReconnectMaxDelay    time.Duration
 	ReconnectMaxAttempts int
 
-	// RefreshAuth is called on AUTH / UNAUTHORIZED before giving up (WS).
+	// RefreshAuth is called on AUTH / UNAUTHORIZED before giving up.
 	RefreshAuth RefreshAuthFunc
 
-	// MaxQueueSize bounds offline points for resume flush (default 10_000).
+	// MaxQueueSize bounds Staging+InFlight (default 10_000).
 	MaxQueueSize int
 	// HelloTimeout waits for Hello after dial (default 10s).
 	HelloTimeout time.Duration
 }
 
 type sender interface {
-	Send(*pb.ClientMsg) error
+	Send(ClientMsg) error
+	SendRaw([]byte) error
 	Close() error
 }
 
@@ -120,7 +107,7 @@ type pendingResume struct {
 }
 
 type resumeResult struct {
-	acked uint64
+	acked uint32
 	err   error
 }
 
@@ -134,28 +121,31 @@ type Client struct {
 	trackUID      string
 	clientSeq     uint64
 	lastAckedSeq  uint64
-	queue         *OfflineQueue
+	buf           *Buffer
+	filter        NoiseFilter
+	unackedFrames int
 	backoff       BackoffState
 	nextPublishAt time.Time
 	nextEventAt   time.Time
-	subscriptions map[string]struct{}
+	subscriptions map[string]*subOpts
+	subByHandle   map[uint8]string
 	intentional   bool
 	dialGen       uint64
 	wsConn        *websocket.Conn
 
-	recvCh chan *pb.ServerMsg
-	cmdCh  chan *pb.Command
+	recvCh chan ServerMsg
+	cmdCh  chan Command
 	errCh  chan error
 
 	startWait  *pendingStart
 	stopWait   *pendingStop
 	resumeWait *pendingResume
+	starting   bool
 
 	reconnectTimer *time.Timer
 }
 
-// Connect opens a tracking session (WS binary protobuf by default).
-// For WS, waits for Hello (or follows Relocate) before returning.
+// Connect opens a tracking session and waits for Hello (or follows Relocate).
 func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Endpoint == "" {
 		return nil, fmt.Errorf("tracking: Endpoint is required")
@@ -172,27 +162,24 @@ func Connect(ctx context.Context, cfg Config) (*Client, error) {
 	c := &Client{
 		cfg:           cfg,
 		state:         StateConnecting,
-		recvCh:        make(chan *pb.ServerMsg, 64),
-		cmdCh:         make(chan *pb.Command, 16),
+		recvCh:        make(chan ServerMsg, 64),
+		cmdCh:         make(chan Command, 16),
 		errCh:         make(chan error, 1),
-		subscriptions: make(map[string]struct{}),
+		subscriptions: make(map[string]*subOpts),
+		subByHandle:   make(map[uint8]string),
 		backoff:       NewBackoff(cfg.ReconnectMinDelay, cfg.ReconnectMaxDelay, cfg.ReconnectMaxAttempts),
-		queue:         NewOfflineQueue(cfg.MaxQueueSize, nil),
+		buf:           NewBuffer(cfg.MaxQueueSize, nil),
+	}
+	for _, uid := range cfg.Subscribe {
+		if uid != "" {
+			c.subscriptions[uid] = &subOpts{includeEvents: true}
+		}
 	}
 
-	switch cfg.Transport {
-	case TransportGRPC:
-		if err := c.connectGRPC(ctx); err != nil {
-			return nil, err
-		}
-		c.setState(StateOpen)
-		return c, nil
-	default:
-		if err := c.dial(ctx, false); err != nil {
-			return nil, err
-		}
-		return c, nil
+	if err := c.dial(ctx, false); err != nil {
+		return nil, err
 	}
+	return c, nil
 }
 
 func (c *Client) setState(s ConnectionState) {
@@ -269,6 +256,7 @@ func (c *Client) dial(ctx context.Context, sendResume bool) error {
 	ws := &wsSender{conn: conn}
 	c.send = ws
 	c.wsConn = conn
+	c.unackedFrames = 0
 	c.mu.Unlock()
 
 	helloCtx, cancel := context.WithTimeout(ctx, c.cfg.HelloTimeout)
@@ -280,18 +268,21 @@ func (c *Client) dial(ctx context.Context, sendResume bool) error {
 		return err
 	}
 
-	switch b := msg.Body.(type) {
-	case *pb.ServerMsg_Hello:
-		// ok
-	case *pb.ServerMsg_Relocate:
+	switch {
+	case msg.Hello != nil:
+		if msg.Hello.Version != ProtocolVersion {
+			_ = conn.Close()
+			return fmt.Errorf("tracking: unsupported protocol version %d", msg.Hello.Version)
+		}
+	case msg.Relocate != nil:
 		_ = conn.Close()
-		return c.handleRelocate(ctx, b.Relocate, sendResume)
-	case *pb.ServerMsg_Error:
+		return c.handleRelocate(ctx, msg.Relocate, sendResume)
+	case msg.Error != nil:
 		_ = conn.Close()
-		return errorFromWire(b.Error)
+		return errorFromWire(msg.Error)
 	default:
 		_ = conn.Close()
-		return fmt.Errorf("tracking: expected hello, got %T", msg.Body)
+		return fmt.Errorf("tracking: expected hello, got %+v", msg)
 	}
 
 	c.mu.Lock()
@@ -308,50 +299,80 @@ func (c *Client) dial(ctx context.Context, sendResume bool) error {
 
 	if sendResume {
 		if err := c.sendResumeAndWait(ctx); err != nil {
-			return err
+			if isFatalResumeError(codeOf(err)) && !isAuthError(codeOf(err)) {
+				// TRACK_NOT_FOUND: stay connected; app must StartTrack.
+			} else if isAuthError(codeOf(err)) {
+				return err
+			} else if !isRetryResumeError(codeOf(err)) {
+				return err
+			} else {
+				return err
+			}
 		}
 	}
 	c.resubscribe()
 	return nil
 }
 
-func readOneWS(ctx context.Context, conn *websocket.Conn) (*pb.ServerMsg, error) {
+func codeOf(err error) ErrorCode {
+	if e, ok := err.(*Error); ok {
+		return e.Code
+	}
+	return 0
+}
+
+func readOneWS(ctx context.Context, conn *websocket.Conn) (ServerMsg, error) {
 	type result struct {
-		msg *pb.ServerMsg
+		msg ServerMsg
 		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
 		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		_, data, err := conn.ReadMessage()
+		mt, data, err := conn.ReadMessage()
 		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
 			ch <- result{err: err}
 			return
 		}
-		var msg pb.ServerMsg
-		if err := proto.Unmarshal(data, &msg); err != nil {
+		if mt == websocket.TextMessage {
+			closeProtocol(conn)
+			ch <- result{err: ErrInvalidFrame}
+			return
+		}
+		msg, err := DecodeServerMsg(data)
+		if err != nil {
+			closeProtocol(conn)
 			ch <- result{err: err}
 			return
 		}
-		ch <- result{msg: &msg}
+		ch <- result{msg: msg}
 	}()
 	select {
 	case <-ctx.Done():
 		_ = conn.Close()
-		return nil, fmt.Errorf("tracking: hello timeout: %w", ctx.Err())
+		return ServerMsg{}, fmt.Errorf("tracking: hello timeout: %w", ctx.Err())
 	case r := <-ch:
 		return r.msg, r.err
 	}
 }
 
-func (c *Client) handleRelocate(ctx context.Context, rel *pb.Relocate, sendResume bool) error {
-	if rel.GetEndpoint() != "" {
+func closeProtocol(conn *websocket.Conn) {
+	_ = conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseProtocolError, ""),
+		time.Now().Add(time.Second),
+	)
+	_ = conn.Close()
+}
+
+func (c *Client) handleRelocate(ctx context.Context, rel *Relocate, sendResume bool) error {
+	if rel.Endpoint != "" {
 		c.mu.Lock()
-		c.cfg.Endpoint = rel.GetEndpoint()
+		c.cfg.Endpoint = rel.Endpoint
 		c.mu.Unlock()
 	}
-	delay := time.Duration(rel.GetRetryAfterMs()) * time.Millisecond
+	delay := time.Duration(rel.RetryAfterMs) * time.Millisecond
 	if delay > 0 {
 		select {
 		case <-ctx.Done():
@@ -371,45 +392,29 @@ func (c *Client) handleRelocate(ctx context.Context, rel *pb.Relocate, sendResum
 	return c.dial(ctx, sendResume)
 }
 
-func (c *Client) connectGRPC(ctx context.Context) error {
-	opts := append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, c.cfg.DialOptions...)
-	conn, err := grpc.NewClient(c.cfg.Endpoint, opts...)
-	if err != nil {
-		return fmt.Errorf("tracking: dial: %w", err)
-	}
-
-	md := metadata.MD{}
-	if c.cfg.Device != nil {
-		md.Set("x-client-id", c.cfg.Device.ClientID)
-		md.Set("x-client-secret", c.cfg.Device.ClientSecret)
-	} else {
-		md.Set("authorization", "Bearer "+c.cfg.Listener.AccessToken)
-	}
-	ctx = metadata.NewOutgoingContext(ctx, md)
-
-	stream, err := pb.NewTrackingClient(conn).Session(ctx)
-	if err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("tracking: session: %w", err)
-	}
-
-	c.mu.Lock()
-	c.send = &grpcSender{conn: conn, stream: stream}
-	c.mu.Unlock()
-	go c.readLoopGRPC(stream)
-	return nil
-}
-
 type wsSender struct {
 	conn *websocket.Conn
 	mu   sync.Mutex
 }
 
-func (w *wsSender) Send(msg *pb.ClientMsg) error {
-	b, err := proto.Marshal(msg)
+func (w *wsSender) Send(msg ClientMsg) error {
+	if msg.Loc != nil && len(msg.Loc.Points) > 1 {
+		frames := EncodeLocFrames(msg.Loc.Seq, msg.Loc.Points)
+		for _, f := range frames {
+			if err := w.SendRaw(f); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	b, err := EncodeClientMsg(msg)
 	if err != nil {
 		return err
 	}
+	return w.SendRaw(b)
+}
+
+func (w *wsSender) SendRaw(b []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.conn.WriteMessage(websocket.BinaryMessage, b)
@@ -419,104 +424,87 @@ func (w *wsSender) Close() error {
 	return w.conn.Close()
 }
 
-type grpcSender struct {
-	conn   *grpc.ClientConn
-	stream grpc.BidiStreamingClient[pb.ClientMsg, pb.ServerMsg]
-}
-
-func (g *grpcSender) Send(msg *pb.ClientMsg) error {
-	return g.stream.Send(msg)
-}
-
-func (g *grpcSender) Close() error {
-	_ = g.stream.CloseSend()
-	return g.conn.Close()
-}
-
 func (c *Client) readLoopWS(conn *websocket.Conn, gen uint64) {
 	for {
-		_, data, err := conn.ReadMessage()
+		mt, data, err := conn.ReadMessage()
 		if err != nil {
 			c.onSocketClosed(gen)
 			return
 		}
-		var msg pb.ServerMsg
-		if err := proto.Unmarshal(data, &msg); err != nil {
-			continue
-		}
-		c.dispatch(&msg)
-	}
-}
-
-func (c *Client) readLoopGRPC(stream grpc.BidiStreamingClient[pb.ClientMsg, pb.ServerMsg]) {
-	defer close(c.recvCh)
-	defer close(c.cmdCh)
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			if err != io.EOF && !c.isClosed() {
-				select {
-				case c.errCh <- err:
-				default:
-				}
-			}
+		if mt == websocket.TextMessage {
+			closeProtocol(conn)
+			c.onSocketClosed(gen)
 			return
+		}
+		msg, err := DecodeServerMsg(data)
+		if err != nil {
+			closeProtocol(conn)
+			c.onSocketClosed(gen)
+			return
+		}
+		if msg == (ServerMsg{}) {
+			continue // unknown server type
 		}
 		c.dispatch(msg)
 	}
 }
 
-func (c *Client) dispatch(msg *pb.ServerMsg) {
-	switch b := msg.Body.(type) {
-	case *pb.ServerMsg_Relocate:
+func (c *Client) dispatch(msg ServerMsg) {
+	switch {
+	case msg.Relocate != nil:
 		go func() {
-			_ = c.handleRelocate(context.Background(), b.Relocate, true)
+			_ = c.handleRelocate(context.Background(), msg.Relocate, true)
 		}()
 		return
-	case *pb.ServerMsg_ResumeOk:
+	case msg.ResumeOk != nil:
 		c.mu.Lock()
-		if uid := b.ResumeOk.GetTrackUid(); uid != "" {
+		if uid := msg.ResumeOk.TrackUID; uid != "" {
 			c.trackUID = uid
 		}
-		c.lastAckedSeq = b.ResumeOk.GetLastAckedSeq()
+		c.lastAckedSeq = uint64(msg.ResumeOk.LastAcked)
 		if c.clientSeq < c.lastAckedSeq {
 			c.clientSeq = c.lastAckedSeq
 		}
-		c.queue.AckThrough(c.lastAckedSeq)
+		c.buf.AckThrough(msg.ResumeOk.LastAcked)
+		c.unackedFrames = 0
 		wait := c.resumeWait
 		c.resumeWait = nil
 		c.mu.Unlock()
-		c.flushQueue()
+		c.resendInFlight()
+		c.flushStaging()
 		if wait != nil {
 			select {
-			case wait.ch <- resumeResult{acked: b.ResumeOk.GetLastAckedSeq()}:
+			case wait.ch <- resumeResult{acked: msg.ResumeOk.LastAcked}:
 			default:
 			}
 		}
 		c.pushRecv(msg)
 		return
-	case *pb.ServerMsg_TrackStarted:
+	case msg.TrackStarted != nil:
 		c.mu.Lock()
-		c.trackUID = b.TrackStarted.GetTrackUid()
+		c.trackUID = msg.TrackStarted.TrackUID
 		c.clientSeq = 0
 		c.lastAckedSeq = 0
-		c.queue.Clear()
+		c.unackedFrames = 0
+		c.starting = false
 		wait := c.startWait
 		c.startWait = nil
 		c.mu.Unlock()
 		if wait != nil {
 			select {
-			case wait.ch <- startResult{uid: b.TrackStarted.GetTrackUid()}:
+			case wait.ch <- startResult{uid: msg.TrackStarted.TrackUID}:
 			default:
 			}
 		}
+		c.flushStaging()
 		c.pushRecv(msg)
 		return
-	case *pb.ServerMsg_TrackStopped:
+	case msg.TrackStopped != nil:
 		c.mu.Lock()
-		if c.trackUID == b.TrackStopped.GetTrackUid() {
+		if c.trackUID == msg.TrackStopped.TrackUID || msg.TrackStopped.TrackUID == "" {
 			c.trackUID = ""
-			c.queue.Clear()
+			c.buf.Clear()
+			c.filter.Reset()
 		}
 		wait := c.stopWait
 		c.stopWait = nil
@@ -529,30 +517,34 @@ func (c *Client) dispatch(msg *pb.ServerMsg) {
 		}
 		c.pushRecv(msg)
 		return
-	case *pb.ServerMsg_LocationAdded:
+	case msg.Ack != nil:
 		c.mu.Lock()
-		if b.LocationAdded.GetClientSeq() > c.lastAckedSeq {
-			c.lastAckedSeq = b.LocationAdded.GetClientSeq()
+		if uint64(msg.Ack.Seq) > c.lastAckedSeq {
+			c.lastAckedSeq = uint64(msg.Ack.Seq)
 		}
-		c.queue.AckThrough(b.LocationAdded.GetClientSeq())
+		c.buf.AckThrough(msg.Ack.Seq)
+		c.unackedFrames = 0
 		c.mu.Unlock()
-		c.pushRecv(msg)
+		c.flushStaging()
 		return
-	case *pb.ServerMsg_Command:
+	case msg.Command != nil:
 		select {
-		case c.cmdCh <- b.Command:
+		case c.cmdCh <- *msg.Command:
 		default:
 		}
 		return
-	case *pb.ServerMsg_Error:
-		err := errorFromWire(b.Error)
+	case msg.Error != nil:
+		err := errorFromWire(msg.Error)
 		c.mu.Lock()
 		if c.resumeWait != nil {
 			w := c.resumeWait
 			c.resumeWait = nil
 			if isFatalResumeError(err.Code) {
 				c.trackUID = ""
-				c.queue.Clear()
+				c.buf.Clear()
+				c.filter.Reset()
+				c.clientSeq = 0
+				c.lastAckedSeq = 0
 			}
 			c.mu.Unlock()
 			select {
@@ -560,12 +552,18 @@ func (c *Client) dispatch(msg *pb.ServerMsg) {
 			default:
 			}
 		} else {
+			if err.Code == ErrorTrackNotFound {
+				c.trackUID = ""
+				c.buf.Clear()
+				c.filter.Reset()
+			}
 			c.mu.Unlock()
 		}
 		c.mu.Lock()
 		if c.startWait != nil {
 			w := c.startWait
 			c.startWait = nil
+			c.starting = false
 			c.mu.Unlock()
 			select {
 			case w.ch <- startResult{err: err}:
@@ -591,12 +589,21 @@ func (c *Client) dispatch(msg *pb.ServerMsg) {
 		}
 		c.pushRecv(msg)
 		return
+	case msg.Subscribed != nil:
+		c.mu.Lock()
+		if opts, ok := c.subscriptions[msg.Subscribed.DeviceUID]; ok {
+			opts.handle = msg.Subscribed.Sub
+			c.subByHandle[msg.Subscribed.Sub] = msg.Subscribed.DeviceUID
+		}
+		c.mu.Unlock()
+		c.pushRecv(msg)
+		return
 	default:
 		c.pushRecv(msg)
 	}
 }
 
-func (c *Client) pushRecv(msg *pb.ServerMsg) {
+func (c *Client) pushRecv(msg ServerMsg) {
 	select {
 	case c.recvCh <- msg:
 	default:
@@ -641,7 +648,6 @@ func (c *Client) handleAuthError(_ *Error) {
 	}
 	sendResume := c.trackUID != ""
 	intentional := c.intentional
-	// Invalidate the rejected socket's readLoop so it won't schedule reconnect.
 	c.dialGen++
 	c.clearReconnectTimerLocked()
 	if c.wsConn != nil {
@@ -669,7 +675,7 @@ func (c *Client) onSocketClosed(gen uint64) {
 		c.mu.Unlock()
 		return
 	}
-	if c.cfg.DisableReconnect || c.cfg.Transport == TransportGRPC {
+	if c.cfg.DisableReconnect {
 		c.setState(StateClosed)
 		c.rejectPendingLocked(fmt.Errorf("tracking: connection closed"))
 		c.mu.Unlock()
@@ -703,6 +709,7 @@ func (c *Client) scheduleReconnectLocked() {
 				c.mu.Unlock()
 				return
 			}
+			// FENCED / TRY_AGAIN: keep track_uid, retry Resume.
 			c.scheduleReconnectLocked()
 			c.mu.Unlock()
 		}
@@ -716,6 +723,7 @@ func (c *Client) rejectPendingLocked(err error) {
 		default:
 		}
 		c.startWait = nil
+		c.starting = false
 	}
 	if c.stopWait != nil {
 		select {
@@ -740,111 +748,172 @@ func (c *Client) clearReconnectTimerLocked() {
 	}
 }
 
-func (c *Client) isClosed() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.state == StateClosed && c.intentional
-}
-
 func (c *Client) resubscribe() {
 	c.mu.Lock()
-	subs := make([]string, 0, len(c.subscriptions))
-	for d := range c.subscriptions {
-		subs = append(subs, d)
+	type item struct {
+		uid  string
+		opts subOpts
+	}
+	subs := make([]item, 0, len(c.subscriptions))
+	for d, o := range c.subscriptions {
+		subs = append(subs, item{uid: d, opts: *o})
+	}
+	c.subByHandle = make(map[uint8]string)
+	for _, o := range c.subscriptions {
+		o.handle = 0
 	}
 	c.mu.Unlock()
-	for _, d := range subs {
-		_ = c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Subscribe{Subscribe: &pb.Subscribe{DeviceUid: d}}})
+	for _, s := range subs {
+		_ = c.Send(ClientMsg{Subscribe: &Subscribe{
+			DeviceUID:     s.uid,
+			IncludeEvents: s.opts.includeEvents,
+			MinIntervalMs: s.opts.minInterval,
+		}})
 	}
 }
 
 func (c *Client) sendResumeAndWait(ctx context.Context) error {
-	c.mu.Lock()
-	uid := c.trackUID
-	seq := c.clientSeq
-	if uid == "" {
-		c.mu.Unlock()
-		return nil
-	}
-	ch := make(chan resumeResult, 1)
-	c.resumeWait = &pendingResume{ctx: ctx, ch: ch}
-	c.mu.Unlock()
-
-	if err := c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Resume{Resume: &pb.Resume{
-		TrackUid: uid, LastClientSeq: seq,
-	}}}); err != nil {
+	for {
 		c.mu.Lock()
-		c.resumeWait = nil
+		uid := c.trackUID
+		seq := uint32(c.clientSeq)
+		if uid == "" {
+			c.mu.Unlock()
+			return nil
+		}
+		ch := make(chan resumeResult, 1)
+		c.resumeWait = &pendingResume{ctx: ctx, ch: ch}
 		c.mu.Unlock()
-		return err
-	}
 
-	select {
-	case <-ctx.Done():
-		c.mu.Lock()
-		c.resumeWait = nil
-		c.mu.Unlock()
-		return ctx.Err()
-	case r := <-ch:
-		return r.err
+		if err := c.Send(ClientMsg{Resume: &Resume{TrackUID: uid, LastSeq: seq}}); err != nil {
+			c.mu.Lock()
+			c.resumeWait = nil
+			c.mu.Unlock()
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			c.mu.Lock()
+			c.resumeWait = nil
+			c.mu.Unlock()
+			return ctx.Err()
+		case r := <-ch:
+			if r.err == nil {
+				return nil
+			}
+			if isRetryResumeError(codeOf(r.err)) {
+				delay := time.Duration(0)
+				if e, ok := r.err.(*Error); ok && e.RetryAfterMs > 0 {
+					delay = time.Duration(e.RetryAfterMs) * time.Millisecond
+				}
+				if delay == 0 {
+					c.mu.Lock()
+					d, ok := NextDelay(&c.backoff, nil)
+					c.mu.Unlock()
+					if !ok {
+						return r.err
+					}
+					delay = d
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(delay):
+				}
+				continue
+			}
+			return r.err
+		}
 	}
 }
 
-func (c *Client) flushQueue() {
+func (c *Client) resendInFlight() {
 	c.mu.Lock()
-	uid := c.trackUID
-	pending := c.queue.PeekAll()
-	open := c.state == StateOpen && c.send != nil
+	open := c.state == StateOpen && c.send != nil && c.trackUID != ""
+	pts := c.buf.PeekInFlight()
+	sender := c.send
 	c.mu.Unlock()
-	if uid == "" || !open || len(pending) == 0 {
+	if !open || len(pts) == 0 || sender == nil {
 		return
 	}
-	points := make([]*pb.LatLng, len(pending))
-	for i, p := range pending {
-		points[i] = p.Point
+	frames := EncodeInFlightFrames(pts)
+	c.mu.Lock()
+	c.unackedFrames += len(frames)
+	c.mu.Unlock()
+	for _, f := range frames {
+		_ = sender.SendRaw(f)
 	}
-	last := pending[len(pending)-1].Seq
-	_ = c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_LocationBatch{LocationBatch: &pb.LocationBatch{
-		TrackUid: uid, ClientSeq: last, Points: stampLatLngs(points),
-	}}})
 }
 
-// Recv returns the next server message (LocationAdded, Subscribed, …).
-// Device Commands are delivered on Commands(), not here.
-func (c *Client) Recv(ctx context.Context) (*pb.ServerMsg, error) {
+func (c *Client) flushStaging() {
+	c.mu.Lock()
+	open := c.state == StateOpen && c.send != nil && c.trackUID != ""
+	window := MaxInFlightFrames - c.unackedFrames
+	assigned := c.buf.AssignFromStaging(&c.clientSeq, window)
+	sender := c.send
+	c.mu.Unlock()
+	if !open || len(assigned) == 0 || sender == nil {
+		return
+	}
+	frames := EncodeInFlightFrames(assigned)
+	c.mu.Lock()
+	c.unackedFrames += len(frames)
+	c.mu.Unlock()
+	for _, f := range frames {
+		_ = sender.SendRaw(f)
+	}
+}
+
+func (c *Client) sendAssigned(pts []InFlightPoint) {
+	c.mu.Lock()
+	open := c.state == StateOpen && c.send != nil
+	sender := c.send
+	c.mu.Unlock()
+	if !open || len(pts) == 0 || sender == nil {
+		return
+	}
+	frames := EncodeInFlightFrames(pts)
+	c.mu.Lock()
+	c.unackedFrames += len(frames)
+	c.mu.Unlock()
+	for _, f := range frames {
+		_ = sender.SendRaw(f)
+	}
+}
+
+// Recv returns the next server message (Loc, Subscribed, …).
+// Device Ack is not delivered here. Commands go to Commands().
+func (c *Client) Recv(ctx context.Context) (ServerMsg, error) {
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return ServerMsg{}, ctx.Err()
 	case err := <-c.errCh:
-		return nil, err
+		return ServerMsg{}, err
 	case msg, ok := <-c.recvCh:
 		if !ok {
-			return nil, io.EOF
+			return ServerMsg{}, io.EOF
 		}
 		return msg, nil
 	}
 }
 
-// Commands is a stream of server→device Command injects (HTTP API).
-func (c *Client) Commands() <-chan *pb.Command {
+// Commands is a stream of server→device Command injects.
+func (c *Client) Commands() <-chan Command {
 	return c.cmdCh
 }
 
 // AckCommand acknowledges a received Command.
-func (c *Client) AckCommand(commandID string, status pb.CommandAckStatus, message string) error {
-	var msg *string
-	if message != "" {
-		msg = &message
-	}
-	return c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_CommandAck{CommandAck: &pb.CommandAck{
-		CommandId: commandID,
+func (c *Client) AckCommand(commandID string, status CommandAckStatus, message string) error {
+	return c.Send(ClientMsg{CommandAck: &CommandAck{
+		CommandID: commandID,
 		Status:    status,
-		Message:   msg,
-	}}})
+		Message:   message,
+	}})
 }
 
 // Send writes a client message on the session.
-func (c *Client) Send(msg *pb.ClientMsg) error {
+func (c *Client) Send(msg ClientMsg) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.state == StateClosed && c.intentional {
@@ -856,25 +925,31 @@ func (c *Client) Send(msg *pb.ClientMsg) error {
 	return c.send.Send(msg)
 }
 
-// StartTrack sends track_start and waits for track_started (or error).
-func (c *Client) StartTrack(ctx context.Context, loc *pb.LatLng, route []*pb.LatLng) (string, error) {
+// StartTrack sends TrackStart and waits for TrackStarted (or error).
+func (c *Client) StartTrack(ctx context.Context, loc *LatLng, route []LatLng) (string, error) {
 	return c.StartTrackMeta(ctx, loc, route, nil)
 }
 
 // StartTrackMeta is StartTrack with opaque metadata (≤4 KiB).
-func (c *Client) StartTrackMeta(ctx context.Context, loc *pb.LatLng, route []*pb.LatLng, metadata []byte) (string, error) {
+func (c *Client) StartTrackMeta(ctx context.Context, loc *LatLng, route []LatLng, metadata []byte) (string, error) {
 	ch := make(chan startResult, 1)
 	c.mu.Lock()
+	c.buf.Clear()
+	c.filter.Reset()
+	c.clientSeq = 0
+	c.lastAckedSeq = 0
+	c.starting = true
 	c.startWait = &pendingStart{ctx: ctx, ch: ch}
 	c.mu.Unlock()
 
-	if err := c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_TrackStart{TrackStart: &pb.TrackStart{
-		Location: stampLatLng(loc),
-		Route:    stampLatLngs(route),
+	if err := c.Send(ClientMsg{TrackStart: &TrackStart{
+		Location: loc,
+		Route:    route,
 		Metadata: metadata,
-	}}}); err != nil {
+	}}); err != nil {
 		c.mu.Lock()
 		c.startWait = nil
+		c.starting = false
 		c.mu.Unlock()
 		return "", err
 	}
@@ -883,6 +958,7 @@ func (c *Client) StartTrackMeta(ctx context.Context, loc *pb.LatLng, route []*pb
 	case <-ctx.Done():
 		c.mu.Lock()
 		c.startWait = nil
+		c.starting = false
 		c.mu.Unlock()
 		return "", ctx.Err()
 	case r := <-ch:
@@ -890,44 +966,57 @@ func (c *Client) StartTrackMeta(ctx context.Context, loc *pb.LatLng, route []*pb
 	}
 }
 
-// Resume sends resume and waits for resume_ok (manual; auto-reconnect also resumes).
+// Resume sends resume and waits for ResumeOk (manual; auto-reconnect also resumes).
 func (c *Client) Resume(ctx context.Context, trackUID string, lastClientSeq uint64) (uint64, error) {
 	c.mu.Lock()
 	c.trackUID = trackUID
 	c.clientSeq = lastClientSeq
-	ch := make(chan resumeResult, 1)
-	c.resumeWait = &pendingResume{ctx: ctx, ch: ch}
 	c.mu.Unlock()
-
-	if err := c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Resume{Resume: &pb.Resume{
-		TrackUid: trackUID, LastClientSeq: lastClientSeq,
-	}}}); err != nil {
-		c.mu.Lock()
-		c.resumeWait = nil
-		c.mu.Unlock()
+	if err := c.sendResumeAndWait(ctx); err != nil {
 		return 0, err
 	}
-
-	select {
-	case <-ctx.Done():
-		c.mu.Lock()
-		c.resumeWait = nil
-		c.mu.Unlock()
-		return 0, ctx.Err()
-	case r := <-ch:
-		return r.acked, r.err
-	}
+	return c.LastAckedSeq(), nil
 }
 
-// Publish sends a location_add on the active track (managed clientSeq).
-// When over MaxPublishHz, returns (currentSeq, false).
-func (c *Client) Publish(point *pb.LatLng) (seq uint64, accepted bool) {
-	c.mu.Lock()
-	if c.trackUID == "" {
-		c.mu.Unlock()
+// Publish filters a GPS sample and either sends Loc or stages it.
+// If there is no live track, the first call sends TrackStart (this point is the start location).
+func (c *Client) Publish(point *LatLng) (seq uint64, accepted bool) {
+	if point == nil {
 		return 0, false
 	}
+	c.mu.Lock()
+	if c.trackUID == "" && !c.starting {
+		c.starting = true
+		c.buf.Clear()
+		c.filter.Reset()
+		c.clientSeq = 0
+		c.lastAckedSeq = 0
+		loc := *point
+		c.mu.Unlock()
+		if err := c.Send(ClientMsg{TrackStart: &TrackStart{Location: &loc}}); err != nil {
+			c.mu.Lock()
+			c.starting = false
+			c.mu.Unlock()
+			return 0, false
+		}
+		return 0, true
+	}
 	now := time.Now()
+	emitted, ok := c.filter.Push(*point, now)
+	if !ok {
+		seq = c.clientSeq
+		c.mu.Unlock()
+		return seq, false
+	}
+	open := c.state == StateOpen && c.send != nil && c.trackUID != ""
+	windowOK := c.unackedFrames < MaxInFlightFrames
+	if !open || !windowOK {
+		StampLatLng(&emitted)
+		c.buf.PushStaging(emitted)
+		seq = c.clientSeq
+		c.mu.Unlock()
+		return seq, true
+	}
 	if !CanAcceptPublish(c.nextPublishAt, now, 1) {
 		seq = c.clientSeq
 		c.mu.Unlock()
@@ -936,44 +1025,30 @@ func (c *Client) Publish(point *pb.LatLng) (seq uint64, accepted bool) {
 	c.nextPublishAt = NextPublishAllowedAt(c.nextPublishAt, now, 1)
 	c.clientSeq++
 	seq = c.clientSeq
-	uid := c.trackUID
-	pt := stampLatLng(cloneLatLng(point))
-	c.queue.Enqueue(seq, pt)
-	open := c.state == StateOpen && c.send != nil
+	item := InFlightPoint{Seq: uint32(seq), Point: emitted}
+	c.buf.inFlight = append(c.buf.inFlight, item)
+	c.buf.enforceCap()
 	c.mu.Unlock()
 
-	if open {
-		_ = c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_LocationAdd{LocationAdd: &pb.LocationAdd{
-			TrackUid: uid, ClientSeq: seq, Point: pt,
-		}}})
-	}
+	c.sendAssigned([]InFlightPoint{item})
 	return seq, true
 }
 
-func cloneLatLng(p *pb.LatLng) *pb.LatLng {
-	if p == nil {
-		return nil
-	}
-	cp := proto.Clone(p).(*pb.LatLng)
-	return cp
-}
-
-// StopTrack sends track_stop and waits for track_stopped (or error).
+// StopTrack sends TrackStop and waits for TrackStopped (or error).
+// No active track is a no-op.
 func (c *Client) StopTrack(ctx context.Context, trackUID string) error {
 	if trackUID == "" {
 		trackUID = c.TrackUID()
 	}
 	if trackUID == "" {
-		return NewError(pb.ErrorCode_ERROR_CODE_INVALID, "no active track")
+		return nil
 	}
 	ch := make(chan error, 1)
 	c.mu.Lock()
 	c.stopWait = &pendingStop{ctx: ctx, ch: ch}
 	c.mu.Unlock()
 
-	if err := c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_TrackStop{TrackStop: &pb.TrackStop{
-		TrackUid: trackUID,
-	}}}); err != nil {
+	if err := c.Send(ClientMsg{TrackStop: &TrackStop{}}); err != nil {
 		c.mu.Lock()
 		c.stopWait = nil
 		c.mu.Unlock()
@@ -994,13 +1069,12 @@ func (c *Client) StopTrack(ctx context.Context, trackUID string) error {
 // SendEvent fans out an opaque payload (≤4 KiB, ≤1 Hz) on the active track.
 func (c *Client) SendEvent(payload []byte) (bool, error) {
 	if len(payload) > MaxEventBytes {
-		return false, NewError(pb.ErrorCode_ERROR_CODE_INVALID, "event payload exceeds 4 KiB")
+		return false, NewError(ErrorInvalid, "event payload exceeds 4 KiB")
 	}
 	c.mu.Lock()
-	uid := c.trackUID
-	if uid == "" {
+	if c.trackUID == "" {
 		c.mu.Unlock()
-		return false, NewError(pb.ErrorCode_ERROR_CODE_INVALID, "startTrack() before sendEvent()")
+		return false, NewError(ErrorInvalid, "startTrack() before sendEvent()")
 	}
 	now := time.Now()
 	if !c.nextEventAt.IsZero() && now.Before(c.nextEventAt) {
@@ -1014,30 +1088,54 @@ func (c *Client) SendEvent(payload []byte) (bool, error) {
 	if !open {
 		return true, nil
 	}
-	ts := now.UnixMilli()
-	err := c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Event{Event: &pb.Event{
-		TrackUid: uid, Payload: payload, TimestampMs: &ts,
-	}}})
+	err := c.Send(ClientMsg{Event: &Event{Payload: payload, TimestampMs: now.UnixMilli()}})
 	return err == nil, err
 }
 
-// Subscribe sends subscribe for a device.
+// Subscribe sends subscribe for a device (include_events on, no extra throttle).
 func (c *Client) Subscribe(deviceUID string) error {
-	c.mu.Lock()
-	c.subscriptions[deviceUID] = struct{}{}
-	c.mu.Unlock()
-	return c.Send(&pb.ClientMsg{Body: &pb.ClientMsg_Subscribe{Subscribe: &pb.Subscribe{
-		DeviceUid: deviceUID,
-	}}})
+	return c.SubscribeFilter(deviceUID, true, 0)
 }
 
-// Close ends the session.
+// SubscribeFilter is Subscribe with include_events and min_interval_ms.
+func (c *Client) SubscribeFilter(deviceUID string, includeEvents bool, minIntervalMs uint16) error {
+	c.mu.Lock()
+	if existing, ok := c.subscriptions[deviceUID]; ok {
+		existing.includeEvents = includeEvents
+		existing.minInterval = minIntervalMs
+	} else {
+		c.subscriptions[deviceUID] = &subOpts{includeEvents: includeEvents, minInterval: minIntervalMs}
+	}
+	c.mu.Unlock()
+	return c.Send(ClientMsg{Subscribe: &Subscribe{
+		DeviceUID:     deviceUID,
+		IncludeEvents: includeEvents,
+		MinIntervalMs: minIntervalMs,
+	}})
+}
+
+// Unsubscribe drops a listener handle (u8 from Subscribed). Unknown sub is a no-op on the server.
+func (c *Client) Unsubscribe(sub uint8) error {
+	c.mu.Lock()
+	if uid, ok := c.subByHandle[sub]; ok {
+		delete(c.subByHandle, sub)
+		delete(c.subscriptions, uid)
+	}
+	c.mu.Unlock()
+	return c.Send(ClientMsg{Unsubscribe: &Unsubscribe{Sub: sub}})
+}
+
+// Close sends TrackStop if a track is live, then hangs up. The SDK will not Resume afterwards.
 func (c *Client) Close() error {
+	uid := c.TrackUID()
+	if uid != "" {
+		_ = c.Send(ClientMsg{TrackStop: &TrackStop{}})
+	}
 	c.mu.Lock()
 	c.intentional = true
 	c.clearReconnectTimerLocked()
 	c.setState(StateClosed)
-	c.rejectPendingLocked(NewError(pb.ErrorCode_ERROR_CODE_INVALID, "client closed"))
+	c.rejectPendingLocked(NewError(ErrorInvalid, "client closed"))
 	send := c.send
 	c.send = nil
 	c.wsConn = nil

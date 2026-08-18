@@ -10,18 +10,22 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pickpoint/go-sdk/tracking"
-	pb "github.com/pickpoint/go-sdk/tracking/v2"
-	"google.golang.org/protobuf/proto"
+)
+
+const (
+	mockTrackUID  = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	mockDeviceUID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	mockNodeID    = "cccccccc-cccc-cccc-cccc-cccccccccccc"
 )
 
 type mockConn struct {
 	mu       sync.Mutex
-	messages []*pb.ClientMsg
+	messages []tracking.ClientMsg
 	ws       *websocket.Conn
 }
 
-func (c *mockConn) send(msg *pb.ServerMsg) error {
-	b, err := proto.Marshal(msg)
+func (c *mockConn) send(msg tracking.ServerMsg) error {
+	b, err := tracking.EncodeServerMsg(msg)
 	if err != nil {
 		return err
 	}
@@ -34,9 +38,9 @@ func (c *mockConn) close() {
 
 type mockOpts struct {
 	auto              bool
-	onMsg             func(msg *pb.ClientMsg, c *mockConn)
+	onMsg             func(msg tracking.ClientMsg, c *mockConn)
 	beforeHello       func(connectionIndex int, c *mockConn)
-	relocateOnConnect *pb.Relocate
+	relocateOnConnect *tracking.Relocate
 }
 
 type mockServer struct {
@@ -47,7 +51,7 @@ type mockServer struct {
 	opts        mockOpts
 }
 
-func startMock(t *testing.T, auto bool, onMsg func(*pb.ClientMsg, *mockConn)) *mockServer {
+func startMock(t *testing.T, auto bool, onMsg func(tracking.ClientMsg, *mockConn)) *mockServer {
 	t.Helper()
 	return startMockOpts(t, mockOpts{auto: auto, onMsg: onMsg})
 }
@@ -59,6 +63,7 @@ func startMockOpts(t *testing.T, opts mockOpts) *mockServer {
 		Subprotocols: []string{tracking.Subprotocol},
 	}
 	ms := &mockServer{opts: opts}
+	nextSub := uint8(1)
 	ms.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ws, err := up.Upgrade(w, r, http.Header{
 			"Sec-WebSocket-Protocol": []string{tracking.Subprotocol},
@@ -77,9 +82,12 @@ func startMockOpts(t *testing.T, opts mockOpts) *mockServer {
 				opts.beforeHello(idx, c)
 			}
 			if opts.relocateOnConnect != nil && idx == 1 {
-				_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_Relocate{Relocate: opts.relocateOnConnect}})
+				_ = c.send(tracking.ServerMsg{Relocate: opts.relocateOnConnect})
 			} else {
-				_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_Hello{Hello: &pb.Hello{NodeId: "mock-1"}}})
+				_ = c.send(tracking.ServerMsg{Hello: &tracking.Hello{
+					Version: tracking.ProtocolVersion,
+					NodeID:  mockNodeID,
+				}})
 			}
 
 			for {
@@ -87,44 +95,40 @@ func startMockOpts(t *testing.T, opts mockOpts) *mockServer {
 				if err != nil {
 					return
 				}
-				var msg pb.ClientMsg
-				if err := proto.Unmarshal(data, &msg); err != nil {
+				msg, err := tracking.DecodeClientMsg(data)
+				if err != nil {
 					continue
 				}
 				c.mu.Lock()
-				c.messages = append(c.messages, proto.Clone(&msg).(*pb.ClientMsg))
+				c.messages = append(c.messages, msg)
 				c.mu.Unlock()
 				if opts.onMsg != nil {
-					opts.onMsg(&msg, c)
+					opts.onMsg(msg, c)
 				}
 				if !opts.auto {
 					continue
 				}
-				switch b := msg.Body.(type) {
-				case *pb.ClientMsg_TrackStart:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_TrackStarted{TrackStarted: &pb.TrackStarted{TrackUid: "track-mock-1"}}})
-				case *pb.ClientMsg_TrackStop:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_TrackStopped{TrackStopped: &pb.TrackStopped{TrackUid: b.TrackStop.GetTrackUid()}}})
-				case *pb.ClientMsg_Resume:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_ResumeOk{ResumeOk: &pb.ResumeOk{
-						TrackUid: b.Resume.GetTrackUid(), LastAckedSeq: 0,
-					}}})
-				case *pb.ClientMsg_LocationAdd:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_LocationAdded{LocationAdded: &pb.LocationAdded{
-						TrackUid: b.LocationAdd.GetTrackUid(), ClientSeq: b.LocationAdd.GetClientSeq(),
-						Point: b.LocationAdd.GetPoint(), DeviceUid: "dev-1",
-					}}})
-				case *pb.ClientMsg_LocationBatch:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_LocationAdded{LocationAdded: &pb.LocationAdded{
-						TrackUid: b.LocationBatch.GetTrackUid(), ClientSeq: b.LocationBatch.GetClientSeq(),
-						DeviceUid: "dev-1",
-					}}})
-				case *pb.ClientMsg_Subscribe:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_Subscribed{Subscribed: &pb.Subscribed{
-						DeviceUid: b.Subscribe.GetDeviceUid(), TrackUid: "track-mock-1",
-					}}})
-				case *pb.ClientMsg_Ping:
-					_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_Pong{Pong: &pb.Pong{}}})
+				switch {
+				case msg.TrackStart != nil:
+					_ = c.send(tracking.ServerMsg{TrackStarted: &tracking.TrackStarted{TrackUID: mockTrackUID}})
+				case msg.TrackStop != nil:
+					_ = c.send(tracking.ServerMsg{TrackStopped: &tracking.TrackStopped{TrackUID: mockTrackUID}})
+				case msg.Resume != nil:
+					_ = c.send(tracking.ServerMsg{ResumeOk: &tracking.ResumeOk{
+						TrackUID:  msg.Resume.TrackUID,
+						LastAcked: 0,
+					}})
+				case msg.Loc != nil:
+					_ = c.send(tracking.ServerMsg{Ack: &tracking.Ack{Seq: msg.Loc.Seq}})
+				case msg.Subscribe != nil:
+					sub := nextSub
+					nextSub++
+					_ = c.send(tracking.ServerMsg{Subscribed: &tracking.Subscribed{
+						Sub:       sub,
+						DeviceUID: msg.Subscribe.DeviceUID,
+						TrackUID:  mockTrackUID,
+						Online:    true,
+					}})
 				}
 			}
 		}()
@@ -160,7 +164,7 @@ func (ms *mockServer) connCount() int {
 	return len(ms.connections)
 }
 
-func (ms *mockServer) waitMsg(t *testing.T, pred func(*pb.ClientMsg) bool, timeout time.Duration) *pb.ClientMsg {
+func (ms *mockServer) waitMsg(t *testing.T, pred func(tracking.ClientMsg) bool, timeout time.Duration) tracking.ClientMsg {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -180,13 +184,13 @@ func (ms *mockServer) waitMsg(t *testing.T, pred func(*pb.ClientMsg) bool, timeo
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("waitMsg timeout")
-	return nil
+	return tracking.ClientMsg{}
 }
 
-func serverError(code pb.ErrorCode, message string) *pb.ServerMsg {
-	return &pb.ServerMsg{Body: &pb.ServerMsg_Error{Error: &pb.Error{
+func serverError(code tracking.ErrorCode, message string) tracking.ServerMsg {
+	return tracking.ServerMsg{Error: &tracking.WireError{
 		Code: code, Message: message,
-	}}}
+	}}
 }
 
 func waitFor(t *testing.T, pred func() bool, timeout time.Duration) {

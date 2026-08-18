@@ -14,7 +14,7 @@ func TestBuildWSURLDevice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if u.Scheme != "wss" || u.Path != "/v2/tracking/ws" {
+	if u.Scheme != "wss" || u.Path != "/v2/ws" {
 		t.Fatalf("%s", u)
 	}
 	q := u.Query()

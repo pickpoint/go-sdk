@@ -34,7 +34,7 @@ func buildWSURL(cfg Config) (*url.URL, error) {
 	}
 	path := cfg.WSPath
 	if path == "" {
-		path = "/v2/tracking/ws"
+		path = "/v2/ws"
 	}
 	u.Path = path
 	q := u.Query()

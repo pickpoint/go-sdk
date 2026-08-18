@@ -3,11 +3,11 @@ package tracking_test
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pickpoint/go-sdk/tracking"
-	pb "github.com/pickpoint/go-sdk/tracking/v2"
 )
 
 func TestReconnectSendsResumeNotTrackStart(t *testing.T) {
@@ -30,9 +30,9 @@ func TestReconnectSendsResumeNotTrackStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Publish(&pb.LatLng{Latitude: 1, Longitude: 2})
+	c.Publish(&tracking.LatLng{Latitude: 1, Longitude: 2})
 	time.Sleep(25 * time.Millisecond)
-	c.Publish(&pb.LatLng{Latitude: 3, Longitude: 4})
+	c.Publish(&tracking.LatLng{Latitude: 3, Longitude: 4})
 	if c.ClientSeq() != 2 {
 		t.Fatalf("seq=%d", c.ClientSeq())
 	}
@@ -40,22 +40,20 @@ func TestReconnectSendsResumeNotTrackStart(t *testing.T) {
 	first := ms.waitConn(t, 2*time.Second)
 	first.close()
 
-	resume := ms.waitMsg(t, func(m *pb.ClientMsg) bool {
-		_, ok := m.Body.(*pb.ClientMsg_Resume)
-		return ok
+	resume := ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Resume != nil
 	}, 8*time.Second)
-	r := resume.GetResume()
-	if r.GetTrackUid() != uid || r.GetLastClientSeq() != 2 {
-		t.Fatalf("%v", r)
+	r := resume.Resume
+	if r.TrackUID != uid || r.LastSeq != 2 {
+		t.Fatalf("%+v", r)
 	}
 
-	// Must not have started a new track on reconnect
 	var starts int
 	ms.mu.Lock()
 	for _, conn := range ms.connections {
 		conn.mu.Lock()
 		for _, m := range conn.messages {
-			if _, ok := m.Body.(*pb.ClientMsg_TrackStart); ok {
+			if m.TrackStart != nil {
 				starts++
 			}
 		}
@@ -70,12 +68,12 @@ func TestReconnectSendsResumeNotTrackStart(t *testing.T) {
 }
 
 func TestReconnectTrackNotFoundClearsCursor(t *testing.T) {
-	ms := startMock(t, false, func(msg *pb.ClientMsg, c *mockConn) {
-		switch msg.Body.(type) {
-		case *pb.ClientMsg_TrackStart:
-			_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_TrackStarted{TrackStarted: &pb.TrackStarted{TrackUid: "t-gone"}}})
-		case *pb.ClientMsg_Resume:
-			_ = c.send(serverError(pb.ErrorCode_ERROR_CODE_TRACK_NOT_FOUND, "track expired"))
+	ms := startMock(t, false, func(msg tracking.ClientMsg, c *mockConn) {
+		switch {
+		case msg.TrackStart != nil:
+			_ = c.send(tracking.ServerMsg{TrackStarted: &tracking.TrackStarted{TrackUID: mockTrackUID}})
+		case msg.Resume != nil:
+			_ = c.send(serverError(tracking.ErrorTrackNotFound, "track expired"))
 		}
 	})
 	defer ms.close()
@@ -95,19 +93,59 @@ func TestReconnectTrackNotFoundClearsCursor(t *testing.T) {
 	if _, err := c.StartTrack(ctx, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if c.TrackUID() != "t-gone" {
+	if c.TrackUID() != mockTrackUID {
 		t.Fatalf("%q", c.TrackUID())
 	}
 
 	conn := ms.waitConn(t, 2*time.Second)
 	conn.close()
 
-	ms.waitMsg(t, func(m *pb.ClientMsg) bool {
-		_, ok := m.Body.(*pb.ClientMsg_Resume)
-		return ok
+	ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Resume != nil
 	}, 8*time.Second)
 
 	waitFor(t, func() bool { return c.TrackUID() == "" }, 5*time.Second)
+}
+
+func TestFencedResumeRetriesNotFatal(t *testing.T) {
+	var resumes atomic.Int32
+	ms := startMock(t, false, func(msg tracking.ClientMsg, c *mockConn) {
+		switch {
+		case msg.TrackStart != nil:
+			_ = c.send(tracking.ServerMsg{TrackStarted: &tracking.TrackStarted{TrackUID: mockTrackUID}})
+		case msg.Resume != nil:
+			n := resumes.Add(1)
+			if n == 1 {
+				_ = c.send(serverError(tracking.ErrorFenced, "draining"))
+			} else {
+				_ = c.send(tracking.ServerMsg{ResumeOk: &tracking.ResumeOk{
+					TrackUID:  mockTrackUID,
+					LastAcked: 0,
+				}})
+			}
+		}
+	})
+	defer ms.close()
+
+	ctx := context.Background()
+	c, err := tracking.Connect(ctx, tracking.Config{
+		Endpoint:          ms.URL,
+		Device:            &tracking.DeviceAuth{ClientID: "c", ClientSecret: "s"},
+		ReconnectMinDelay: 15 * time.Millisecond,
+		ReconnectMaxDelay: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if _, err := c.StartTrack(ctx, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := ms.waitConn(t, 2*time.Second)
+	conn.close()
+
+	waitFor(t, func() bool { return resumes.Load() >= 2 && c.TrackUID() == mockTrackUID }, 8*time.Second)
 }
 
 func TestRelocateDialsNewEndpoint(t *testing.T) {
@@ -116,7 +154,7 @@ func TestRelocateDialsNewEndpoint(t *testing.T) {
 
 	gateway := startMockOpts(t, mockOpts{
 		auto: false,
-		relocateOnConnect: &pb.Relocate{
+		relocateOnConnect: &tracking.Relocate{
 			Endpoint:     target.URL,
 			RetryAfterMs: 10,
 		},
@@ -144,7 +182,7 @@ func TestRelocateDialsNewEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if uid != "track-mock-1" {
+	if uid != mockTrackUID {
 		t.Fatalf("%q", uid)
 	}
 }
@@ -182,19 +220,20 @@ func TestQueueFlushAfterResume(t *testing.T) {
 	conn.close()
 
 	waitFor(t, func() bool { return c.State() == tracking.StateReconnecting }, 3*time.Second)
-	seq, ok := c.Publish(&pb.LatLng{Latitude: 9, Longitude: 9})
-	if !ok || seq != 1 {
-		t.Fatalf("seq=%d ok=%v", seq, ok)
+	seq, ok := c.Publish(&tracking.LatLng{Latitude: 9, Longitude: 9})
+	if !ok {
+		t.Fatal("publish while reconnecting should stage")
+	}
+	if seq != 0 {
+		t.Fatalf("seq=%d want 0 (assigned after filter+flush)", seq)
 	}
 	release.Done()
 
-	ms.waitMsg(t, func(m *pb.ClientMsg) bool {
-		_, ok := m.Body.(*pb.ClientMsg_Resume)
-		return ok
+	ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Resume != nil
 	}, 8*time.Second)
-	ms.waitMsg(t, func(m *pb.ClientMsg) bool {
-		_, batch := m.Body.(*pb.ClientMsg_LocationBatch)
-		_, add := m.Body.(*pb.ClientMsg_LocationAdd)
-		return batch || add
+	ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Loc != nil
 	}, 8*time.Second)
+	waitFor(t, func() bool { return c.ClientSeq() == 1 }, 3*time.Second)
 }

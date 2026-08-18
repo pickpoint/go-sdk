@@ -2,15 +2,12 @@ package tracking_test
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pickpoint/go-sdk/tracking"
-	pb "github.com/pickpoint/go-sdk/tracking/v2"
-	"google.golang.org/protobuf/proto"
 )
 
 func TestPublishRateLimit(t *testing.T) {
@@ -28,13 +25,13 @@ func TestPublishRateLimit(t *testing.T) {
 	}
 	defer c.Close()
 
-	if _, err := c.StartTrack(ctx, &pb.LatLng{Latitude: 1, Longitude: 2}, nil); err != nil {
+	if _, err := c.StartTrack(ctx, &tracking.LatLng{Latitude: 1, Longitude: 2}, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	accepted := 0
 	for i := 0; i < tracking.MaxPublishHz*3; i++ {
-		_, ok := c.Publish(&pb.LatLng{Latitude: float64(i), Longitude: 0})
+		_, ok := c.Publish(&tracking.LatLng{Latitude: float64(i), Longitude: 0})
 		if ok {
 			accepted++
 		}
@@ -47,7 +44,7 @@ func TestPublishRateLimit(t *testing.T) {
 	}
 
 	time.Sleep(tracking.MinPublishInterval + 5*time.Millisecond)
-	seq, ok := c.Publish(&pb.LatLng{Latitude: 9, Longitude: 9})
+	seq, ok := c.Publish(&tracking.LatLng{Latitude: 9, Longitude: 9})
 	if !ok || seq != 2 {
 		t.Fatalf("ok=%v seq=%d", ok, seq)
 	}
@@ -100,23 +97,14 @@ func TestResumeAfterPublish(t *testing.T) {
 	}
 	defer c.Close()
 
-	uid, err := c.StartTrack(ctx, &pb.LatLng{Latitude: 1, Longitude: 1}, nil)
+	uid, err := c.StartTrack(ctx, &tracking.LatLng{Latitude: 1, Longitude: 1}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := c.Publish(&pb.LatLng{Latitude: 2, Longitude: 2}); !ok {
+	if _, ok := c.Publish(&tracking.LatLng{Latitude: 2, Longitude: 2}); !ok {
 		t.Fatal("publish")
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		msg, err := c.Recv(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := msg.Body.(*pb.ServerMsg_LocationAdded); ok {
-			break
-		}
-	}
+	waitFor(t, func() bool { return c.LastAckedSeq() == 1 }, 2*time.Second)
 
 	acked, err := c.Resume(ctx, uid, 1)
 	if err != nil {
@@ -125,23 +113,21 @@ func TestResumeAfterPublish(t *testing.T) {
 	if acked != 0 {
 		t.Fatalf("acked=%d", acked)
 	}
-	ms.waitMsg(t, func(m *pb.ClientMsg) bool {
-		_, ok := m.Body.(*pb.ClientMsg_Resume)
-		return ok
+	ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Resume != nil
 	}, 2*time.Second)
 }
 
 func TestListenerSubscribeAndLocation(t *testing.T) {
-	ms := startMock(t, true, func(msg *pb.ClientMsg, c *mockConn) {
-		if sub, ok := msg.Body.(*pb.ClientMsg_Subscribe); ok {
+	ms := startMock(t, true, func(msg tracking.ClientMsg, c *mockConn) {
+		if msg.Subscribe != nil {
 			go func() {
 				time.Sleep(20 * time.Millisecond)
-				_ = c.send(&pb.ServerMsg{Body: &pb.ServerMsg_LocationAdded{LocationAdded: &pb.LocationAdded{
-					DeviceUid: sub.Subscribe.GetDeviceUid(),
-					TrackUid:  "t1",
-					ClientSeq: 3,
-					Point:     &pb.LatLng{Latitude: 1.5, Longitude: 2.5},
-				}}})
+				_ = c.send(tracking.ServerMsg{Loc: &tracking.ServerLoc{
+					Sub:   1,
+					Seq:   3,
+					Point: tracking.LatLng{Latitude: 1.5, Longitude: 2.5},
+				}})
 			}()
 		}
 	})
@@ -158,7 +144,7 @@ func TestListenerSubscribeAndLocation(t *testing.T) {
 	}
 	defer c.Close()
 
-	if err := c.Subscribe("device-1"); err != nil {
+	if err := c.Subscribe(mockDeviceUID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,43 +154,63 @@ func TestListenerSubscribeAndLocation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		switch b := msg.Body.(type) {
-		case *pb.ServerMsg_LocationAdded:
-			if b.LocationAdded.GetPoint().GetLatitude() != 1.5 {
-				t.Fatalf("%v", b.LocationAdded)
+		if msg.Loc != nil {
+			if msg.Loc.Point.Latitude != 1.5 {
+				t.Fatalf("%+v", msg.Loc)
 			}
 			return
-		case *pb.ServerMsg_Subscribed:
-			continue
 		}
 	}
 	t.Fatal("no location")
 }
 
-func TestGoldenResumeWire(t *testing.T) {
-	msg := tracking.ClientResume("track-uid-9", 42)
-	b, err := tracking.EncodeClientMsg(msg)
+func TestUnsubscribeByHandle(t *testing.T) {
+	ms := startMock(t, true, nil)
+	defer ms.close()
+	ctx := context.Background()
+	c, err := tracking.Connect(ctx, tracking.Config{
+		Endpoint:         ms.URL,
+		Listener:         &tracking.ListenerAuth{AccessToken: "jwt"},
+		DisableReconnect: true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var round pb.ClientMsg
-	if err := proto.Unmarshal(b, &round); err != nil {
+	defer c.Close()
+
+	if err := c.Subscribe(mockDeviceUID); err != nil {
 		t.Fatal(err)
 	}
-	if round.GetResume().GetTrackUid() != "track-uid-9" || round.GetResume().GetLastClientSeq() != 42 {
-		t.Fatalf("%v", round.GetResume())
+	deadline := time.Now().Add(2 * time.Second)
+	var handle uint8
+	for time.Now().Before(deadline) {
+		msg, err := c.Recv(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg.Subscribed != nil {
+			handle = msg.Subscribed.Sub
+			break
+		}
 	}
-	got := hex.EncodeToString(b)
-	const want = "0a0f0a0b747261636b2d7569642d39102a"
-	if got != want {
-		t.Fatalf("golden wire changed:\n got %s\nwant %s", got, want)
+	if handle == 0 {
+		t.Fatal("no subscribed handle")
+	}
+	if err := c.Unsubscribe(handle); err != nil {
+		t.Fatal(err)
+	}
+	un := ms.waitMsg(t, func(m tracking.ClientMsg) bool {
+		return m.Unsubscribe != nil && m.Unsubscribe.Sub == handle
+	}, 2*time.Second)
+	if un.Unsubscribe.Sub != handle {
+		t.Fatalf("%+v", un.Unsubscribe)
 	}
 }
 
 func TestAuthErrorWithoutRefreshCloses(t *testing.T) {
-	ms := startMock(t, false, func(msg *pb.ClientMsg, c *mockConn) {
-		if _, ok := msg.Body.(*pb.ClientMsg_TrackStart); ok {
-			_ = c.send(serverError(pb.ErrorCode_ERROR_CODE_AUTH, "bad creds"))
+	ms := startMock(t, false, func(msg tracking.ClientMsg, c *mockConn) {
+		if msg.TrackStart != nil {
+			_ = c.send(serverError(tracking.ErrorAuth, "bad creds"))
 		}
 	})
 	defer ms.close()
@@ -223,7 +229,7 @@ func TestAuthErrorWithoutRefreshCloses(t *testing.T) {
 
 	_, err = c.StartTrack(ctx, nil, nil)
 	var te *tracking.Error
-	if !errors.As(err, &te) || te.Code != pb.ErrorCode_ERROR_CODE_AUTH {
+	if !errors.As(err, &te) || te.Code != tracking.ErrorAuth {
 		t.Fatalf("%v", err)
 	}
 	waitFor(t, func() bool { return c.State() == tracking.StateClosed }, 3*time.Second)
@@ -238,9 +244,9 @@ func TestAuthErrorRefreshRedials(t *testing.T) {
 		beforeHello: func(int, *mockConn) {
 			hellos.Add(1)
 		},
-		onMsg: func(msg *pb.ClientMsg, c *mockConn) {
-			if _, ok := msg.Body.(*pb.ClientMsg_TrackStart); ok {
-				_ = c.send(serverError(pb.ErrorCode_ERROR_CODE_UNAUTHORIZED, "expired"))
+		onMsg: func(msg tracking.ClientMsg, c *mockConn) {
+			if msg.TrackStart != nil {
+				_ = c.send(serverError(tracking.ErrorUnauthorized, "expired"))
 			}
 		},
 	})
