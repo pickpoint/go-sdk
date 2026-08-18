@@ -304,8 +304,8 @@ PICKPOINT_API_KEY=… go test ./pickpoint -run E2E -count=1
 
 ### CI & release
 
-- **PR** → `.github/workflows/ci.yml` (`go test`)
-- **Push to `main`** (untagged HEAD) → bump **patch** in `VERSION`, tag `vX.Y.Z`, GitHub Release in the same job  
+- **PR to `dev`** → `.github/workflows/ci.yml` (`go test`)
+- **Merge `dev` → `main`** (untagged HEAD) → bump **patch** in `VERSION`, tag `vX.Y.Z`, GitHub Release in the same job  
   (tag push via `GITHUB_TOKEN` does not start new workflows — release cannot wait on the tag event)
 - **Manual tag `v*`** (pushed by a human) → GitHub Release
 
@@ -317,4 +317,8 @@ Minor/major: bump `VERSION` in a PR, merge with `[skip release]` in the commit m
 git tag v2.1.0
 git push origin v2.1.0
 ```
+
+## Contributing
+
+Fork and open a PR against **`dev`**. [CONTRIBUTING.md](CONTRIBUTING.md).
 
